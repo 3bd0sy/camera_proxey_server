@@ -27,26 +27,31 @@ We use **mkcert** to generate locally-trusted SSL certificates. This avoids brow
 #### 📦 Install mkcert
 
 **Windows (Chocolatey):**
+
 ```powershell
 choco install mkcert
 ```
 
 **Windows (Scoop):**
+
 ```powershell
 scoop install mkcert
 ```
 
 **Manual download:**
+
 1. Download from: https://github.com/FiloSottile/mkcert/releases
 2. Choose `mkcert-v1.4.4-windows-amd64.exe`
 3. Rename it to `mkcert.exe` and place it in a folder on your `PATH` (e.g., `C:\Windows\System32\`).
 
 **macOS:**
+
 ```bash
 brew install mkcert
 ```
 
 **Linux:**
+
 ```bash
 sudo apt install libnss3-tools
 # Download mkcert binary from GitHub releases
@@ -59,6 +64,7 @@ mkcert -install
 ```
 
 Expected output:
+
 ```
 Created a new local CA at "C:\Users\<you>\AppData\Local\mkcert"
 The local CA is now installed in the system trust store!
@@ -86,6 +92,7 @@ camera_server/ssl/
 ```
 
 > 💡 **Tip:** You can add more hostnames or IPs if other machines need to reach the server, e.g.:
+>
 > ```bash
 > mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 192.168.1.10 camera.internal
 > ```
@@ -116,6 +123,217 @@ python run.py
 
 ---
 
+## 🏗️ Architecture — How the Server Works & Why It Solves the Problem
+
+### 🚨 The Problem: Cameras on a Separate Network
+
+In many deployments, **QGIS runs on the user's machine, but cameras live on a separate, isolated network** (camera VLAN, industrial network, or remote site). There is no direct route from the user's PC to the camera.
+
+```
+        User Network                   Camera Network
+        192.168.1.0/24                 10.10.0.0/16
+
+        ┌──────────┐                   ┌──────────┐
+        │  QGIS    │                   │ Camera 1 │
+        │ .1.50    │                   │ 10.10.10.10
+        └────┬─────┘                   └──────────┘
+             │                                ▲
+             │  RTSP?                         │
+             │  ❌ NO ROUTE                   │
+             └────────────────────────────────┘
+                      (blocked by firewall)
+```
+
+**Why this fails:**
+
+- ❌ Firewall rules block traffic from user LAN to camera VLAN.
+- ❌ Cameras are often on private, non-routable IPs.
+- ❌ Exposing camera credentials on every user machine is risky.
+- ❌ Cameras typically support only 3–5 concurrent RTSP connections.
+
+---
+
+### ✅ The Solution: A Dual-Homed Proxy Server
+
+The **FastAPI server acts as a bridge** between two networks. It has:
+
+- **One interface** on the user network (for QGIS).
+- **One interface** on the camera network (for RTSP).
+
+```
+        User Network                   Camera Network
+        192.168.1.0/24                 10.10.0.0/16
+
+        ┌──────────┐                   ┌──────────┐
+        │  QGIS    │                   │ Camera 1 │
+        │ .1.50    │                   │ 10.10.10.10
+        └────┬─────┘                   └────┬─────┘
+             │                              ▲
+             │ HTTPS (8443)                 │ RTSP (554)
+             │                              │
+        ┌────▼──────────────────────────────┴────┐
+        │       Proxy Server (dual-homed)        │
+        │                                        │
+        │  eth0: 192.168.1.10  ← User side       │
+        │  eth1: 10.10.0.5     ← Camera side     │
+        │                                        │
+        │  ┌──────────────────────────────────┐  │
+        │  │  FastAPI    +    FFmpeg/MediaMTX │  │
+        │  └──────────────────────────────────┘  │
+        └────────────────────────────────────────┘
+```
+
+---
+
+### 🔄 End-to-End Data Flow
+
+When the user clicks a camera in QGIS:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  STEP 1 — QGIS requests a stream                                      │
+│                                                                       │
+│  QGIS ──HTTPS POST /api/v1/streams──► FastAPI                         │
+│         {"camera_id": "cam-001",                                      │
+│          "host": "10.21.2.10", ...}                                   │
+│                                                                       │
+├───────────────────────────────────────────────────────────────────────┤
+│  STEP 2 — FastAPI validates & creates a session                       │
+│                                                                       │
+│  FastAPI:                                                             │
+│    ✓ Checks SSRF: 10.21.2.10 ∈ allowed_camera_networks               │
+│    ✓ Builds RTSP URL with encoded credentials                        │
+│    ✓ Starts FFmpeg subprocess (or MediaMTX path)                     │
+│    ✓ Returns a temporary session URL                                 │
+│                                                                      │
+│  QGIS ◄──{"stream_url": "https://server/api/v1/streams/.../video"}   │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│  STEP 3 — FFmpeg connects to the camera (server side)                │
+│                                                                      │
+│  FFmpeg ──RTSP (over eth1)──► Camera 10.21.2.10                      │
+│         ◄──H.264 stream──────                                        │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│  STEP 4 — FFmpeg transcodes & pipes MJPEG to FastAPI                 │
+│                                                                      │
+│  FFmpeg ──MJPEG chunks──► FastAPI                                    │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│  STEP 5 — FastAPI streams MJPEG back to QGIS                         │
+│                                                                      │
+│  FastAPI ──HTTPS (multipart/x-mixed-replace)──► QGIS                 │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│  STEP 6 — User closes the viewer                                     │
+│                                                                      │
+│  QGIS ──HTTPS DELETE /api/v1/streams/{id}──► FastAPI                 │
+│  FastAPI:                                                            │
+│    ✓ Stops FFmpeg                                                    │
+│    ✓ Closes RTSP connection                                          │
+│    ✓ Destroys session (frees memory)                                 │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 🧩 Component Diagram
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                              QGIS                                       │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────┐      │
+│  │              Camera Viewer Plugin                            │      │
+│  │                                                              │      │
+│  │   ┌──────────────┐    ┌───────────────┐   ┌──────────────┐   │      │
+│  │   │ 📹 Viewer    │    │ ⚙️ Data Mgr  │   │ 🌐 Server    │  │      │
+│  │   └──────┬───────┘    └───────────────┘   └──────┬───────┘  │      │
+│  │          │                                       │          │      │
+│  │          │ Direct (RTSP) ────────────────────────┼──┐       │      │
+│  │          │ Proxy (HTTPS) ─────────────────────┐  │  │       │      │
+│  └──────────┼────────────────────────────────────┼──┼──┼───────┘      │
+└─────────────┼────────────────────────────────────┼──┼──┼──────────────┘
+              │                                    │  │  │
+              │ RTSP (Direct Mode)                 │  │  │
+              │                                    │  │  │
+              │                                    │  │  │ HTTP(S)
+              │                                    │  │  │
+              │                                    ▼  │  │
+              │                    ┌───────────────────────────────┐
+              │                    │        Proxy Server           │
+              │                    │                               │
+              │                    │  ┌─────────────────────────┐ │
+              │                    │  │   FastAPI (control)     │ │
+              │                    │  │                         │ │
+              │                    │  │  ┌─────────┐ ┌───────┐  │ │
+              │                    │  │  │  Auth   │ │  SSRF │  │ │
+              │                    │  │  └─────────┘ └───────┘  │ │
+              │                    │  │  ┌─────────┐ ┌───────┐  │ │
+              │                    │  │  │Sessions │ │ Audit │  │ │
+              │                    │  │  └─────────┘ └───────┘  │ │
+              │                    │  └───────────┬─────────────┘ │
+              │                    │              │               │
+              │                    │              ▼               │
+              │                    │  ┌─────────────────────────┐ │
+              │                    │  │   Media Backend         │ │
+              │                    │  │                         │ │
+              │                    │  │  ┌──────────────────┐   │ │
+              │                    │  │  │     FFmpeg       │   │ │
+              │                    │  │  │  (MJPEG inline)  │   │ │
+              │                    │  │  └────────┬─────────┘   │ │
+              │                    │  │  ┌────────▼─────────┐   │ │
+              │                    │  │  │     MediaMTX     │   │ │
+              │                    │  │  │  (RTSP/WebRTC)   │   │ │
+              │                    │  │  └──────────────────┘   │ │
+              │                    │  └──────────┬──────────────┘ │
+              │                    └─────────────┼────────────────┘
+              │                                  │
+              │                                  │ RTSP (554)
+              │                                  ▼
+              │                    ┌───────────────────────────────┐
+              │                    │     Camera Network            │
+              │                    │                               │
+              │                    │  ┌─────────┐  ┌─────────┐     │
+              │                    │  │Camera 1 │  │Camera 2 │     │
+              │                    │  │10.21.x  │  │10.21.x  │     │
+              │                    │  └─────────┘  └─────────┘     │
+              │                    └───────────────────────────────┘
+              │
+              └───────────► (Direct mode only — same network)
+```
+
+---
+
+### 🔀 Two Connection Modes
+
+The plugin supports two modes, configurable in **🌐 Server Settings**:
+
+#### Mode 1 — Direct
+
+```
+QGIS ─────────────────RTSP──────────────► Camera
+```
+
+- **When:** QGIS and camera are on the same network.
+- **Pros:** No server required, lowest latency.
+- **Cons:** Every client needs credentials, camera hit by every user.
+
+#### Mode 2 — Proxy (recommended for distributed setups)
+
+```
+QGIS ──HTTPS──► Server ──RTSP──► Camera
+```
+
+- **When:** Cameras are on an isolated network or shared by many users.
+- **Pros:** Single credential store, one RTSP connection per camera, works across networks.
+- **Cons:** Adds a hop, needs a server.
+
+Switch modes anytime without changing the camera layer.
+
+---
+
 ## 📖 Full Documentation
 
 - **[HTTPS Setup Guide](./HTTPS_SETUP.md)** — complete walkthrough for enabling HTTPS
@@ -128,27 +346,27 @@ python run.py
 The `config.yaml` file contains:
 
 ```yaml
-server:      # Server host, port, API key, public_url
-security:    # SSRF protection (allowed networks, protocols, ports)
-sessions:    # TTL-based session management
-media:       # Media backends (FFmpeg / MediaMTX)
-audit:       # Event logging
-ssl:         # HTTPS certificate configuration
+server: # Server host, port, API key, public_url
+security: # SSRF protection (allowed networks, protocols, ports)
+sessions: # TTL-based session management
+media: # Media backends (FFmpeg / MediaMTX)
+audit: # Event logging
+ssl: # HTTPS certificate configuration
 ```
 
 ---
 
 ## 📌 Key Files
 
-| File                  | Description                       |
-| --------------------- | --------------------------------- |
-| `run.py`              | Main entry point                  |
-| `config.yaml`         | Core configuration                |
-| `app/main.py`         | FastAPI application               |
-| `app/api/streams.py`  | Stream control endpoints          |
-| `generate_ssl.py`     | SSL certificate generator (fallback) |
-| `ssl/`                | mkcert-generated certificates     |
-| `HTTPS_SETUP.md`      | Detailed HTTPS setup guide        |
+| File                 | Description                          |
+| -------------------- | ------------------------------------ |
+| `run.py`             | Main entry point                     |
+| `config.yaml`        | Core configuration                   |
+| `app/main.py`        | FastAPI application                  |
+| `app/api/streams.py` | Stream control endpoints             |
+| `generate_ssl.py`    | SSL certificate generator (fallback) |
+| `ssl/`               | mkcert-generated certificates        |
+| `HTTPS_SETUP.md`     | Detailed HTTPS setup guide           |
 
 ---
 
@@ -199,14 +417,14 @@ print(response.json())
 
 ## 🔐 Why mkcert Instead of Self-Signed?
 
-| Aspect               | Self-Signed             | mkcert                          |
-| -------------------- | ----------------------- | ------------------------------- |
-| Browser warnings     | ⚠️ Always               | ✅ None                         |
-| Python `urllib`      | ❌ `SSL: CERTIFICATE_VERIFY_FAILED` | ✅ Works out of the box |
-| FFmpeg input         | ⚠️ Requires `-tls_verify 0` | ✅ Works without extra flags  |
-| Setup complexity     | Low                     | Low (one-time `mkcert -install`) |
-| Suitable for dev     | Yes                     | ✅ Yes                          |
-| Suitable for prod    | ❌ Never                | ❌ Use Let's Encrypt instead    |
+| Aspect            | Self-Signed                         | mkcert                           |
+| ----------------- | ----------------------------------- | -------------------------------- |
+| Browser warnings  | ⚠️ Always                           | ✅ None                          |
+| Python `urllib`   | ❌ `SSL: CERTIFICATE_VERIFY_FAILED` | ✅ Works out of the box          |
+| FFmpeg input      | ⚠️ Requires `-tls_verify 0`         | ✅ Works without extra flags     |
+| Setup complexity  | Low                                 | Low (one-time `mkcert -install`) |
+| Suitable for dev  | Yes                                 | ✅ Yes                           |
+| Suitable for prod | ❌ Never                            | ❌ Use Let's Encrypt instead     |
 
 ---
 
@@ -326,4 +544,3 @@ mkcert -CAROOT
 # Uninstall the local CA (if needed)
 mkcert -uninstall
 ```
-
