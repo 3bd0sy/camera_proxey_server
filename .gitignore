@@ -1,0 +1,33 @@
+# Environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and databases
+*.log
+audit.log
+
+# SSL certificates and keys (sensitive!)
+ssl/private.key
+ssl/certificate.crt
+ssl/
+
+# Configuration files with secrets
+.env
+.env.local
+config.local.yaml
+config.yaml
+
+# OS files
+.DS_Store
+Thumbs.db

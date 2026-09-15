@@ -1,0 +1,44 @@
+server:
+  host: "0.0.0.0"
+  port: 8443
+  api_key: "change-me-in-production"
+  public_url: ""
+  ssl:
+    enabled: true
+    cert_file: "ssl/cert.pem"
+    key_file: "ssl/key.pem"
+    # ssl_version: "TLSv1_2"
+
+security:
+  # SSRF protection — only these networks allowed as camera hosts
+  allowed_camera_networks:
+    - "10.0.0.0/8"
+    - "127.0.0.0/8"
+  allowed_protocols: ["RTSP"]
+  allowed_ports: [554, 8554]
+
+sessions:
+  ttl_seconds: 3600
+  cleanup_interval_seconds: 60
+  max_concurrent_sessions: 50
+
+# Media backend: "ffmpeg" or "mediamtx"
+media:
+  backend: "ffmpeg"
+
+  ffmpeg:
+    binary_path: "ffmpeg"
+    rtsp_transport: "tcp"
+    framerate: 15
+    jpeg_quality: 5
+
+  mediamtx:
+    api_url: "http://127.0.0.1:9997"
+    public_rtsp_host: "127.0.0.1"
+    public_rtsp_port: 8554
+    username: ""
+    password: ""
+
+audit:
+  enabled: true
+  file: "audit.log"
